@@ -14,113 +14,178 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import os
 import sys
+import time
 
-# Download necessary NLTK data
-nltk.download('stopwords')
-nltk.download('punkt')
+# Step 1: Download required NLTK data for text processing
+print("Setting up NLTK...")
+nltk.download('stopwords')  # Words like "the", "a", "an" that we want to ignore
+nltk.download('punkt')      # For sentence tokenization
 
-# Connect to MongoDB with error handling
-try:
-    # Try localhost connection first (MongoDB Community)
-    client = pymongo.MongoClient("mongodb://localhost:27017/", serverSelectionTimeoutMS=5000)
-    # Verify connection
-    client.server_info()
-    print("Connected to local MongoDB instance")
-except pymongo.errors.ServerSelectionTimeoutError:
-    print("Warning: Could not connect to local MongoDB. Make sure MongoDB is running.")
-    print("Saving model without MongoDB storage.")
-    client = None
+# Step 2: Connect to MongoDB (required for this project)
+print("Connecting to MongoDB...")
 
-# Set up database and collections if MongoDB is available
-if client:
-    db = client["movie_reviews_db"]
-    reviews_collection = db["reviews"]
-    model_collection = db["model_metrics"]
+# Function to connect with retry
+def connect_to_mongodb(max_retries=3, retry_delay=2):
+    retries = 0
+    while retries < max_retries:
+        try:
+            # Try to connect to a local MongoDB server
+            client = pymongo.MongoClient("mongodb://localhost:27017/", serverSelectionTimeoutMS=5000)
+            # Test the connection
+            client.server_info()
+            print("Successfully connected to MongoDB!")
+            
+            # Set up database and collections
+            db = client["movie_reviews_db"]
+            reviews_collection = db["reviews"]
+            model_collection = db["model_metrics"]
+            user_reviews_collection = db["user_reviews"]
+            
+            return client, db, reviews_collection, model_collection, user_reviews_collection, True
+        except Exception as e:
+            retries += 1
+            print(f"MongoDB connection attempt {retries} failed: {str(e)}")
+            if retries < max_retries:
+                print(f"Retrying in {retry_delay} seconds...")
+                time.sleep(retry_delay)
+            else:
+                print("All connection attempts failed.")
+                return None, None, None, None, None, False
 
-# Load the dataset
+# Connect to MongoDB
+client, db, reviews_collection, model_collection, user_reviews_collection, mongodb_available = connect_to_mongodb()
+
+if not mongodb_available:
+    print("\n==================================================================")
+    print("ERROR: MongoDB connection failed. This project requires MongoDB.")
+    print("Please make sure MongoDB is installed and running on localhost:27017")
+    print("Install MongoDB using:")
+    print("  sudo apt update")
+    print("  sudo apt install -y mongodb")
+    print("  sudo systemctl start mongodb")
+    print("==================================================================\n")
+    sys.exit(1)  # Exit the script if MongoDB is not available
+
+# Step 3: Load the movie reviews dataset
 print("Loading dataset...")
 df = pd.read_csv("IMDB Dataset.csv")
+print(f"Loaded {len(df)} reviews from IMDB Dataset")
 
-# Data Preprocessing
-def preprocess_text(text):
+# Step 4: Define a function to clean and prepare the text
+def clean_text(text):
     # Remove HTML tags
     text = re.sub('<.*?>', ' ', text)
-    # Remove non-alphabetic characters
+    # Keep only letters (remove numbers, punctuation)
     text = re.sub('[^a-zA-Z]', ' ', text)
     # Convert to lowercase
     text = text.lower()
-    # Tokenize
-    tokens = text.split()
-    # Remove stopwords
+    # Split into words
+    words = text.split()
+    # Remove common words like "the", "is", etc.
     stop_words = set(stopwords.words('english'))
-    tokens = [word for word in tokens if word not in stop_words]
-    # Stemming
+    words = [word for word in words if word not in stop_words]
+    # Reduce words to their root form
     stemmer = PorterStemmer()
-    tokens = [stemmer.stem(word) for word in tokens]
-    # Join tokens back into text
-    return ' '.join(tokens)
+    words = [stemmer.stem(word) for word in words]
+    # Join the words back together
+    return ' '.join(words)
 
-print("Preprocessing data...")
-df['processed_review'] = df['review'].apply(preprocess_text)
+# Step 5: Clean all the reviews
+print("Cleaning and preprocessing text data...")
+df['processed_review'] = df['review'].apply(clean_text)
 
-# Convert sentiment labels to binary
+# Step 6: Convert sentiment labels to numbers (1 for positive, 0 for negative)
 df['sentiment_label'] = df['sentiment'].apply(lambda x: 1 if x == 'positive' else 0)
 
-# Store preprocessed data in MongoDB if available
-if client:
-    print("Storing preprocessed data in MongoDB...")
-    reviews_collection.delete_many({})  # Clear existing data
-    reviews_data = df[['review', 'processed_review', 'sentiment', 'sentiment_label']].to_dict('records')
-    reviews_collection.insert_many(reviews_data)
-else:
-    print("Skipping MongoDB storage due to connection issue.")
+# Step 7: Store all IMDB reviews in MongoDB
+print("Storing all IMDB reviews in MongoDB...")
+# Clear existing data first
+reviews_collection.delete_many({})
+# Convert the dataframe to a list of dictionaries
+reviews_data = df[['review', 'processed_review', 'sentiment', 'sentiment_label']].to_dict('records')
+# Insert into MongoDB
+result = reviews_collection.insert_many(reviews_data)
+print(f"Successfully inserted {len(result.inserted_ids)} reviews into MongoDB")
 
-# Split the data
+# Step 8: Check for any user reviews in the database
+print("Checking for user reviews in MongoDB...")
+user_reviews = list(user_reviews_collection.find({}))
+if user_reviews:
+    print(f"Found {len(user_reviews)} user reviews in the database")
+    
+    # Convert user reviews to dataframe
+    user_df = pd.DataFrame(user_reviews)
+    
+    # Create a combined dataframe with both IMDB and user reviews
+    user_df = user_df[['review', 'processed_review', 'prediction', 'confidence']]
+    user_df['sentiment'] = user_df['prediction']
+    user_df['sentiment_label'] = user_df['prediction'].apply(lambda x: 1 if x == 'positive' else 0)
+    
+    # Combine datasets (optional - if you want to include user reviews in training)
+    # Uncomment to include user reviews in your training
+    # df = pd.concat([df, user_df[['review', 'processed_review', 'sentiment', 'sentiment_label']]], ignore_index=True)
+    # print(f"Combined dataset now has {len(df)} reviews")
+else:
+    print("No user reviews found in the database")
+
+# Step 9: Get all reviews from MongoDB to ensure we're using the database
+print("Retrieving all reviews from MongoDB for training...")
+mongo_reviews = list(reviews_collection.find({}))
+print(f"Retrieved {len(mongo_reviews)} reviews from MongoDB")
+
+# Convert to DataFrame
+mongo_df = pd.DataFrame(mongo_reviews)
+
+# Step 10: Split the data into training and testing sets
+print("Splitting data into training and testing sets...")
 X_train, X_test, y_train, y_test = train_test_split(
-    df['processed_review'], 
-    df['sentiment_label'],
-    test_size=0.2,
-    random_state=42
+    mongo_df['processed_review'],  # Use the data from MongoDB
+    mongo_df['sentiment_label'],   # The sentiment labels from MongoDB
+    test_size=0.2,                 # Use 20% for testing
+    random_state=42                # Set seed for reproducibility
 )
 
-# Feature extraction with TF-IDF
-print("Extracting features...")
-vectorizer = TfidfVectorizer(max_features=5000)
+# Step 11: Convert text to numerical features using TF-IDF
+print("Converting text to numerical features...")
+vectorizer = TfidfVectorizer(max_features=5000)  # Limit to 5000 features for efficiency
 X_train_vectors = vectorizer.fit_transform(X_train)
 X_test_vectors = vectorizer.transform(X_test)
 
-# Train the model
+# Step 12: Train the logistic regression model
 print("Training model...")
-model = LogisticRegression(max_iter=1000)
+model = LogisticRegression(max_iter=1000)  # Increase iterations to ensure convergence
 model.fit(X_train_vectors, y_train)
 
-# Evaluate the model
-print("Evaluating model...")
+# Step 13: Evaluate the model on test data
+print("Evaluating model performance...")
 y_pred = model.predict(X_test_vectors)
 accuracy = accuracy_score(y_test, y_pred)
 report = classification_report(y_test, y_pred, output_dict=True)
 cm = confusion_matrix(y_test, y_pred)
 
+# Step 14: Print the performance metrics
 print(f"Accuracy: {accuracy:.4f}")
 print("Classification Report:")
 print(classification_report(y_test, y_pred))
 
-# Save metrics to MongoDB if available
-if client:
-    metrics = {
-        "accuracy": accuracy,
-        "precision_pos": report['1']['precision'],
-        "recall_pos": report['1']['recall'],
-        "f1_pos": report['1']['f1-score'],
-        "precision_neg": report['0']['precision'],
-        "recall_neg": report['0']['recall'],
-        "f1_neg": report['0']['f1-score'],
-        "confusion_matrix": cm.tolist()
-    }
-    model_collection.delete_many({})  # Clear existing data
-    model_collection.insert_one(metrics)
+# Step 15: Save the metrics to MongoDB
+print("Saving metrics to MongoDB...")
+metrics = {
+    "accuracy": accuracy,
+    "precision_pos": report['1']['precision'],
+    "recall_pos": report['1']['recall'],
+    "f1_pos": report['1']['f1-score'],
+    "precision_neg": report['0']['precision'],
+    "recall_neg": report['0']['recall'],
+    "f1_neg": report['0']['f1-score'],
+    "confusion_matrix": cm.tolist(),
+    "last_updated": pd.Timestamp.now().isoformat()
+}
+model_collection.delete_many({})  # Clear existing data
+model_collection.insert_one(metrics)
 
-# Visualize confusion matrix
+# Step 16: Create and save a visualization of the confusion matrix
+print("Creating confusion matrix visualization...")
 plt.figure(figsize=(8, 6))
 sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
             xticklabels=['Negative', 'Positive'], 
@@ -130,12 +195,13 @@ plt.ylabel('Actual')
 plt.title('Confusion Matrix')
 plt.savefig('confusion_matrix.png')
 
-# Save model and vectorizer
+# Step 17: Save the model and vectorizer for later use
 print("Saving model and vectorizer...")
 joblib.dump(model, 'model.pkl')
 joblib.dump(vectorizer, 'vectorizer.pkl')
 
-# Also save metrics to a file to ensure availability even without MongoDB
+# Step 18: Save model metrics to a file (as backup)
+print("Saving metrics to file...")
 metrics_file = {
     "accuracy": float(accuracy),
     "precision_pos": float(report['1']['precision']),
@@ -144,8 +210,16 @@ metrics_file = {
     "precision_neg": float(report['0']['precision']),
     "recall_neg": float(report['0']['recall']),
     "f1_neg": float(report['0']['f1-score']),
-    "confusion_matrix": cm.tolist()
+    "confusion_matrix": cm.tolist(),
+    "last_updated": pd.Timestamp.now().isoformat()
 }
 joblib.dump(metrics_file, 'model_metrics.pkl')
 
-print("Training completed successfully!") 
+# Step 19: Print MongoDB stats
+print("\nMongoDB Database Statistics:")
+print(f"IMDB Reviews: {reviews_collection.count_documents({})}")
+print(f"User Reviews: {user_reviews_collection.count_documents({})}")
+print(f"Model Metrics: {model_collection.count_documents({})}")
+
+print("\nTraining completed successfully!")
+print("You can now run the Streamlit app using: streamlit run app.py") 
